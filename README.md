@@ -289,5 +289,5 @@ Please include tests and update documentation where applicable.
 License
 BlazeWSGI is licensed under the MIT License. See LICENSE for details.
 Contact
-For issues, feature requests, or questions, open an issue on GitHub or contact your.email@example.com (mailto:your.email@example.com).
+For issues, feature requests, or questions, open an issue on GitHub or contact support@kehem.com (mailto:support@kehem.com).
 
