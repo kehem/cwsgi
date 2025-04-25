@@ -6,7 +6,6 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <syslog.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <time.h>
@@ -20,6 +19,7 @@
 #include <openssl/err.h>
 #include <sys/un.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #define BUFFER_SIZE 4096
 #define MAX_SOCKETS 16
@@ -43,6 +43,9 @@ static SSL_CTX *ssl_ctx = NULL;
 static PyObject *pModule = NULL, *pFunc = NULL, *start_response = NULL;
 static struct event *health_check_event = NULL, *scale_check_event = NULL;
 static char *wsgi_path = NULL;
+static char *log_dir = NULL;
+static FILE *log_file = NULL;
+static char current_date[11]; // YYYY-MM-DD
 
 // Configuration
 static int min_workers = 2;
@@ -97,13 +100,13 @@ static int init_ssl(void) {
     OpenSSL_add_ssl_algorithms();
     ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!ssl_ctx) {
-        syslog(LOG_ERR, "Failed to create SSL context");
+        fprintf(stderr, "Failed to create SSL context\n");
         return 1;
     }
 
     if (SSL_CTX_use_certificate_file(ssl_ctx, CERT_FILE, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(ssl_ctx, KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
-        syslog(LOG_ERR, "Failed to load SSL certificates");
+        fprintf(stderr, "Failed to load SSL certificates\n");
         return 1;
     }
 
@@ -145,7 +148,7 @@ static int init_python(void) {
 
     if (!pModule) {
         PyErr_Print();
-        syslog(LOG_ERR, "Failed to load WSGI module from %s", wsgi_path);
+        fprintf(stderr, "Failed to load WSGI module from %s\n", wsgi_path);
         return 1;
     }
 
@@ -153,7 +156,7 @@ static int init_python(void) {
     pFunc = PyObject_GetAttrString(pModule, "application");
     if (!pFunc || !PyCallable_Check(pFunc)) {
         PyErr_Print();
-        syslog(LOG_ERR, "Failed to load 'application' callable from %s", wsgi_path);
+        fprintf(stderr, "Failed to load 'application' callable from %s\n", wsgi_path);
         return 1;
     }
 
@@ -184,7 +187,7 @@ static void cleanup_python(void) {
 static int parse_config(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (!file) {
-        syslog(LOG_ERR, "Failed to open config file: %s", filename);
+        fprintf(stderr, "Failed to open config file: %s\n", filename);
         return 1;
     }
 
@@ -229,6 +232,8 @@ static int parse_config(const char *filename) {
                     scale_threshold_low = atoi(value);
                 } else if (strcmp(key, "wsgi_path") == 0) {
                     wsgi_path = strdup(value);
+                } else if (strcmp(key, "log_dir") == 0) {
+                    log_dir = strdup(value);
                 }
             }
         }
@@ -237,11 +242,50 @@ static int parse_config(const char *filename) {
     fclose(file);
     if (num_sockets == 0) socket_paths[num_sockets++] = strdup("/tmp/wsgi.sock");
     if (!wsgi_path) {
-        syslog(LOG_ERR, "wsgi_path not specified in config");
+        fprintf(stderr, "wsgi_path not specified in config\n");
         return 1;
+    }
+    if (!log_dir) {
+        fprintf(stderr, "log_dir not specified in config\n");
+        return 1;
+    }
+    // Ensure log directory exists
+    struct stat st = {0};
+    if (stat(log_dir, &st) == -1) {
+        if (mkdir(log_dir, 0755) == -1) {
+            fprintf(stderr, "Failed to create log directory %s\n", log_dir);
+            return 1;
+        }
     }
     current_workers = min_workers;
     return 0;
+}
+
+// Log file management
+static void open_log_file(void) {
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char new_date[11];
+    strftime(new_date, sizeof(new_date), "%Y-%m-%d", tm);
+
+    if (strcmp(new_date, current_date) != 0 || !log_file) {
+        if (log_file) {
+            flush_log_buffer();
+            fclose(log_file);
+            log_file = NULL;
+        }
+
+        strcpy(current_date, new_date);
+        char log_path[MAX_PATH];
+        snprintf(log_path, MAX_PATH, "%s/%s.log", log_dir, current_date);
+
+        log_file = fopen(log_path, "a");
+        if (!log_file) {
+            fprintf(stderr, "Failed to open log file %s\n", log_path);
+            exit(1);
+        }
+        setvbuf(log_file, NULL, _IOLBF, 0); // Line-buffered
+    }
 }
 
 // Rate limiting
@@ -296,17 +340,28 @@ static void cleanup_rate_limit(void) {
 
 // Batch logging
 static void flush_log_buffer(void) {
+    if (!log_file) open_log_file();
     for (int i = 0; i < log_count; i++) {
-        syslog(LOG_INFO, "%s", log_buffer[i]);
+        fprintf(log_file, "%s\n", log_buffer[i]);
     }
+    fflush(log_file);
     log_count = 0;
 }
 
 static void log_request(const char *fmt, ...) {
+    open_log_file();
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm);
+
+    char message[BUFFER_SIZE];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(log_buffer[log_count], BUFFER_SIZE, fmt, args);
+    vsnprintf(message, BUFFER_SIZE, fmt, args);
     va_end(args);
+
+    snprintf(log_buffer[log_count], BUFFER_SIZE, "[%s] %s", timestamp, message);
     if (++log_count >= MAX_LOG_BATCH) flush_log_buffer();
 }
 
@@ -378,7 +433,7 @@ static void metrics_accept_cb(struct evconnlistener *listener, evutil_socket_t f
     struct event_base *base = (struct event_base *)ctx;
     struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
     if (!bev) {
-        syslog(LOG_ERR, "Error creating metrics bufferevent");
+        log_request("Error creating metrics bufferevent");
         close(fd);
         return;
     }
@@ -540,7 +595,7 @@ static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
     }
 
     if (!bev) {
-        syslog(LOG_ERR, "Error creating bufferevent");
+        log_request("Error creating bufferevent");
         close(fd);
         return;
     }
@@ -550,7 +605,7 @@ static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
     struct client_data *data = (struct client_data *)calloc(1, sizeof(struct client_data));
     if (!data) {
-        syslog(LOG_ERR, "Error allocating client data");
+        log_request("Error allocating client data");
         bufferevent_free(bev);
         return;
     }
@@ -576,18 +631,18 @@ static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 static void start_worker(struct event_base *base, int worker_id) {
     pid_t pid = fork();
     if (pid < 0) {
-        syslog(LOG_ERR, "Fork failed for worker %d", worker_id);
+        log_request("Fork failed for worker %d", worker_id);
         return;
     }
     if (pid == 0) {
         if (init_python()) {
-            syslog(LOG_ERR, "Failed to initialize Python");
+            log_request("Failed to initialize Python");
             exit(1);
         }
 
         base = event_base_new();
         if (!base) {
-            syslog(LOG_ERR, "Could not initialize libevent");
+            log_request("Could not initialize libevent");
             cleanup_python();
             exit(1);
         }
@@ -602,7 +657,7 @@ static void start_worker(struct event_base *base, int worker_id) {
 
             int fd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (fd < 0) {
-                syslog(LOG_ERR, "Failed to create socket for %s", socket_paths[j]);
+                log_request("Failed to create socket for %s", socket_paths[j]);
                 exit(1);
             }
 
@@ -610,7 +665,7 @@ static void start_worker(struct event_base *base, int worker_id) {
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
             if (bind(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-                syslog(LOG_ERR, "Failed to bind socket %s", socket_paths[j]);
+                log_request("Failed to bind socket %s", socket_paths[j]);
                 close(fd);
                 exit(1);
             }
@@ -618,7 +673,7 @@ static void start_worker(struct event_base *base, int worker_id) {
             listen(fd, SOMAXCONN);
             listeners[j] = evconnlistener_new(base, accept_cb, base, LEV_OPT_CLOSE_ON_FREE, -1, fd);
             if (!listeners[j]) {
-                syslog(LOG_ERR, "Could not create listener for %s", socket_paths[j]);
+                log_request("Could not create listener for %s", socket_paths[j]);
                 close(fd);
                 exit(1);
             }
@@ -694,24 +749,18 @@ static void cleanup_zombies(int sig) {
 }
 
 int main(int argc, char *argv[]) {
-    openlog("c_wsgi_server", LOG_PID | LOG_NDELAY, LOG_DAEMON);
-    log_request("Starting server");
-
     if (argc != 2) {
-        syslog(LOG_ERR, "Usage: %s <config.ini>", argv[0]);
-        closelog();
+        fprintf(stderr, "Usage: %s <config.ini>\n", argv[0]);
         return 1;
     }
 
     if (parse_config(argv[1])) {
-        syslog(LOG_ERR, "Failed to parse config file");
-        closelog();
+        fprintf(stderr, "Failed to parse config file\n");
         return 1;
     }
 
     if (use_ssl && init_ssl()) {
-        syslog(LOG_ERR, "SSL initialization failed");
-        closelog();
+        fprintf(stderr, "SSL initialization failed\n");
         return 1;
     }
 
@@ -720,15 +769,13 @@ int main(int argc, char *argv[]) {
 
     worker_pids = (pid_t *)calloc(max_workers, sizeof(pid_t));
     if (!worker_pids) {
-        syslog(LOG_ERR, "Failed to allocate worker PIDs");
-        closelog();
+        log_request("Failed to allocate worker PIDs");
         return 1;
     }
 
     rate_limit_table = (struct rate_limit_entry **)calloc(rate_limit_table_size, sizeof(struct rate_limit_entry *));
     if (!rate_limit_table) {
-        syslog(LOG_ERR, "Failed to allocate rate limit table");
-        closelog();
+        log_request("Failed to allocate rate limit table");
         return 1;
     }
 
@@ -737,8 +784,7 @@ int main(int argc, char *argv[]) {
 
         struct event_base *base = event_base_new();
         if (!base) {
-            syslog(LOG_ERR, "Could not initialize libevent");
-            closelog();
+            log_request("Could not initialize libevent");
             return 1;
         }
 
@@ -754,9 +800,8 @@ int main(int argc, char *argv[]) {
             (struct sockaddr *)&metrics_addr, sizeof(metrics_addr));
 
         if (!metrics_listener) {
-            syslog(LOG_ERR, "Could not create metrics listener");
+            log_request("Could not create metrics listener");
             event_base_free(base);
-            closelog();
             return 1;
         }
 
@@ -772,6 +817,7 @@ int main(int argc, char *argv[]) {
             start_worker(base, i);
         }
 
+        log_request("Master process started with %d workers", current_workers);
         event_base_dispatch(base);
 
         event_free(health_check_event);
@@ -786,8 +832,10 @@ int main(int argc, char *argv[]) {
     }
 
     flush_log_buffer();
+    if (log_file) fclose(log_file);
     free(worker_pids);
     free(wsgi_path);
+    free(log_dir);
     for (int i = 0; i < num_sockets; i++) {
         free(socket_paths[i]);
     }
@@ -796,6 +844,5 @@ int main(int argc, char *argv[]) {
         SSL_CTX_free(ssl_ctx);
         EVP_cleanup();
     }
-    closelog();
     return 0;
 }
