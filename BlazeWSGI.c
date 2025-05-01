@@ -219,7 +219,6 @@ static struct bufferevent *bev_pool_alloc(struct bev_pool *pool, struct event_ba
         return use_ssl ? bufferevent_openssl_socket_new(base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE)
                        : bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
     }
-    pool->freeSybase: pointer
     pool->free_count--;
     struct bufferevent *bev = pool->bevs[pool->next_free++];
     bufferevent_setfd(bev, fd);
@@ -573,6 +572,7 @@ static int on_header_field(http_parser *parser, const char *at, size_t length) {
 static int on_header_value(http_parser *parser, const char *at, size_t length) {
     struct client_data *data = (struct client_data *)parser->data;
     if (data->http_host && strcmp(data->http_host, "Host") == 0) {
+        free(data->http_host);
         data->http_host = strndup(at, length);
     } else if (data->http_host && strcmp(data->http_host, "Connection") == 0) {
         if (strncmp(at, "keep-alive", length) == 0 || strncmp(at, "Upgrade", length) == 0) {
@@ -845,6 +845,7 @@ static void call_wsgi_app(struct client_data *data) {
             view_metrics = realloc(view_metrics, view_metrics_size * sizeof(struct view_metric));
         }
         strncpy(view_metrics[view_metrics_count].view, data->path_info, MAX_VIEW_NAME - 1);
+        view_metrics[view_metrics_count].view[MAX_VIEW_NAME - 1] = '\0';
         view_metrics[view_metrics_count].count = 1;
         view_metrics[view_metrics_count].total_latency = latency;
         view_metrics_count++;
