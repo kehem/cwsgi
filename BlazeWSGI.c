@@ -13,6 +13,7 @@
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_ssl.h>
 #include <event2/listener.h>
+#include <event2/buffer.h>
 #include <http_parser.h>
 #include <Python.h>
 #include <openssl/ssl.h>
@@ -56,8 +57,8 @@ struct memory_pool client_pool;
 struct memory_pool buffer_pool;
 
 // Global variables
+static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t reload = 0;
-static volatile sig_atomic_t shutdown = 0;
 static pid_t *worker_pids = NULL;
 static char *socket_paths[MAX_SOCKETS];
 static int num_sockets = 0;
@@ -88,7 +89,8 @@ static int scale_threshold_low = 200;
 
 // Metrics
 static _Atomic long request_count = 0;
-static _Atomic double total_latency = 0.0;
+static double total_latency = 0.0;
+static pthread_mutex_t latency_mutex = PTHREAD_MUTEX_INITIALIZER;
 static long latency_buckets[LATENCY_BUCKETS] = {0};
 static _Atomic long active_workers = 0;
 static _Atomic long requests_per_second = 0;
@@ -132,6 +134,15 @@ struct bev_pool {
 };
 static struct bev_pool bev_pool;
 
+// HTTP parser settings
+static http_parser_settings settings = {
+    .on_url = NULL,
+    .on_header_field = NULL,
+    .on_header_value = NULL,
+    .on_body = NULL,
+    .on_message_complete = NULL
+};
+
 // Client data
 struct client_data {
     struct bufferevent *bev;
@@ -154,6 +165,14 @@ struct client_data {
     int is_websocket;
     char *ws_key;
 };
+
+// Forward declarations
+static void flush_log_buffer(void);
+static void metrics_accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
+                             struct sockaddr *addr, int socklen, void *ctx);
+static void metrics_cb(struct bufferevent *bev, void *arg);
+static void websocket_read_cb(struct bufferevent *bev, void *arg);
+static void event_cb(struct bufferevent *bev, short events, void *arg);
 
 // Memory pool functions
 static void init_memory_pool(struct memory_pool *pool, size_t block_size) {
@@ -200,12 +219,10 @@ static struct bufferevent *bev_pool_alloc(struct bev_pool *pool, struct event_ba
         return use_ssl ? bufferevent_openssl_socket_new(base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE)
                        : bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
     }
+    pool->freeSybase: pointer
     pool->free_count--;
     struct bufferevent *bev = pool->bevs[pool->next_free++];
     bufferevent_setfd(bev, fd);
-    if (use_ssl) {
-        bufferevent_openssl_set_ssl(bev, ssl);
-    }
     return bev;
 }
 
@@ -616,7 +633,7 @@ static void *metrics_thread(void *arg) {
 }
 
 static void metrics_accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
-                              struct sockaddr *addr, int socklen, void *ctx) {
+                             struct sockaddr *addr, int socklen, void *ctx) {
     struct event_base *base = (struct event_base *)ctx;
     struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
     bufferevent_setcb(bev, metrics_cb, NULL, NULL, NULL);
@@ -779,8 +796,9 @@ static void call_wsgi_app(struct client_data *data) {
     size_t offset = 0;
 
     if (pValue) {
-        PyObject *status_obj = PyDict_GetItemString(PyEval_Gets(), "_status");
-        PyObject *headers_obj = PyDict_GetItemString(PyEval_GetGlobals(), "_headers");
+        PyObject *globals = PyEval_GetGlobals();
+        PyObject *status_obj = PyDict_GetItemString(globals, "_status");
+        PyObject *headers_obj = PyDict_GetItemString(globals, "_headers");
         data->status = status_obj ? strdup(PyUnicode_AsUTF8(status_obj)) : strdup("200 OK");
         data->headers = headers_obj ? headers_obj : PyList_New(0);
         Py_XINCREF(data->headers);
@@ -807,7 +825,9 @@ static void call_wsgi_app(struct client_data *data) {
         double latency = (end_time.tv_sec - data->start_time.tv_sec) +
                          (end_time.tv_nsec - data->start_time.tv_nsec) / 1e9;
         atomic_fetch_add(&request_count, 1);
-        atomic_fetch_add(&total_latency, latency);
+        pthread_mutex_lock(&latency_mutex);
+        total_latency += latency;
+        pthread_mutex_unlock(&latency_mutex);
         atomic_fetch_add(&requests_per_second, 1);
         int bucket = (int)(latency * 1000);
         if (bucket < LATENCY_BUCKETS) latency_buckets[bucket]++;
@@ -868,7 +888,7 @@ static void read_cb(struct bufferevent *bev, void *arg) {
         data->buffer[data->bytes_received] = '\0';
 
         if (data->parser.data) {
-            size_t nparsed = http_parser_execute(&data->parser, (http_parser_settings *)data->parser.data,
+            size_t nparsed = http_parser_execute(&data->parser, &settings,
                                                 data->buffer, data->bytes_received);
             if (data->parser.http_errno != HPE_OK) {
                 const char *error = "HTTP/1.1 400 Bad Request\r\n\r\nBad Request";
@@ -908,15 +928,15 @@ static void read_cb(struct bufferevent *bev, void *arg) {
 
     cleanup:
         if (data->parser.data) {
-            free(data->parser.data);
+            data->parser.data = NULL;
         }
         free(data->path_info);
         free(data->http_host);
         free(data->request_method);
         free(data->status);
         free(data->ws_key);
-        Py_XINCREF(data->headers);
-        Py_XINCREF(data->environ);
+        Py_XDECREF(data->headers);
+        Py_XDECREF(data->environ);
         if (data->in_pool) {
             pool_free(&buffer_pool, data->buffer);
             pool_free(&client_pool, data);
@@ -932,15 +952,15 @@ static void event_cb(struct bufferevent *bev, short events, void *arg) {
     if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT)) {
         struct client_data *data = (struct client_data *)arg;
         if (data->parser.data) {
-            free(data->parser.data);
+            data->parser.data = NULL;
         }
         free(data->path_info);
         free(data->http_host);
         free(data->request_method);
         free(data->status);
         free(data->ws_key);
-        Py_XINCREF(data->headers);
-        Py_XINCREF(data->environ);
+        Py_XDECREF(data->headers);
+        Py_XDECREF(data->environ);
         if (data->in_pool) {
             pool_free(&buffer_pool, data->buffer);
             pool_free(&client_pool, data);
@@ -961,7 +981,9 @@ static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
     const char *client_ip = "local";
     if (!check_rate_limit(client_ip)) {
         const char *error = "HTTP/1.1 429 Too Many Requests\r\n\r\nRate Limit Exceeded";
-        write(fd, error, strlen(error));
+        if (write(fd, error, strlen(error)) < 0) {
+            log_request("Failed to write rate limit response to %s", client_ip);
+        }
         close(fd);
         log_request("Rate limit exceeded for %s", client_ip);
         return;
@@ -987,18 +1009,17 @@ static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
     strcpy(data->client_ip, client_ip);
     clock_gettime(CLOCK_MONOTONIC, &data->start_time);
     http_parser_init(&data->parser, HTTP_REQUEST);
-    static http_parser_settings settings = {
-        .on_url = on_url,
-        .on_header_field = on_header_field,
-        .on_header_value = on_header_value,
-        .on_body = on_body,
-        .on_message_complete = on_message_complete
-    };
     data->parser.data = &settings;
     data->request_method = strdup(http_method_str(data->parser.method));
     data->body_length = 0;
     data->is_websocket = 0;
     data->ws_key = NULL;
+
+    settings.on_url = on_url;
+    settings.on_header_field = on_header_field;
+    settings.on_header_value = on_header_value;
+    settings.on_body = on_body;
+    settings.on_message_complete = on_message_complete;
 
     bufferevent_setcb(bev, read_cb, NULL, event_cb, data);
     bufferevent_enable(bev, EV_READ | EV_WRITE);
@@ -1106,7 +1127,6 @@ static void inotify_cb(evutil_socket_t fd, short events, void *arg) {
         if (worker_pids[worker_idx] > 0) {
             log_request("Detected code change, reloading worker %d", worker_idx);
             kill(worker_pids[worker_idx], SIGTERM);
-            // Wait for worker to exit
             waitpid(worker_pids[worker_idx], NULL, 0);
             start_worker(base, worker_idx);
             sleep(1); // Ensure new worker binds before proceeding
@@ -1160,7 +1180,7 @@ static void sighup_handler(int sig) {
 }
 
 static void sigterm_handler(int sig) {
-    shutdown = 1;
+    g_shutdown = 1;
     for (int i = 0; i < current_workers; i++) {
         if (worker_pids[i] > 0) {
             kill(worker_pids[i], SIGTERM);
@@ -1220,7 +1240,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    while (!shutdown) {
+    while (!g_shutdown) {
         reload = 0;
         struct event_base *base = event_base_new();
         if (!base) {
